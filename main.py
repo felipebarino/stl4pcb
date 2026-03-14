@@ -1,136 +1,168 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from pygerber.gerberx3.api.v2 import GerberFile, ColorScheme
 from PIL import Image
-from skimage import measure
-from stl import mesh as stl_mesh
-from shapely.geometry import Polygon
-from shapely.ops import triangulate
 import argparse
 import os
-import pyvista as pv
+import logging
+from methods.multipolygon import get_polygons, extrude_multipolygon
+from methods.pixel import create_pixel_mesh
 
-def extrude_contours(contours, thickness, dpmm):
-    all_facets = []
-    
-    for contour in contours:
-        if len(contour) < 3:
-            continue
-            
-        # 1. Scale to mm and map (row, col) -> (x, y)
-        # scipy/skimage returns (y, x), we want (x, y)
-        points_2d = np.column_stack((contour[:, 1] / dpmm, contour[:, 0] / dpmm))
-        
-        # 2. Create Side Walls
-        for i in range(len(points_2d) - 1):
-            p1, p2 = points_2d[i], points_2d[i+1]
-            # Wall Triangle 1
-            all_facets.append([[p1[0], p1[1], 0], [p2[0], p2[1], 0], [p1[0], p1[1], thickness]])
-            # Wall Triangle 2
-            all_facets.append([[p2[0], p2[1], 0], [p2[0], p2[1], thickness], [p1[0], p1[1], thickness]])
+# Configure logging format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("main")
 
-        # 3. Create Caps using Shapely (Ear Clipping / Triangulation)
-        poly = Polygon(points_2d)
-        if not poly.is_valid:
-            poly = poly.buffer(0) # Fix self-intersections if any
-            
-        # Triangulate the polygon surface
-        # Note: get_parts/interiors handles holes if we had them grouped
-        from shapely.ops import triangulate
-        triangles = triangulate(poly)
-        
-        for tri in triangles:
-            # Only keep triangles that are actually inside our polygon
-            if poly.contains(tri.centroid):
-                coords = list(tri.exterior.coords)
-                v1, v2, v3 = coords[0], coords[1], coords[2]
-                
-                # Bottom Cap (Z=0)
-                all_facets.append([[v1[0], v1[1], 0], [v3[0], v3[1], 0], [v2[0], v2[1], 0]])
-                # Top Cap (Z=thickness)
-                all_facets.append([[v1[0], v1[1], thickness], [v2[0], v2[1], thickness], [v3[0], v3[1], thickness]])
+def main():
+    """
+    Main execution flow:
+    1. Parse arguments.
+    2. Convert Gerber to a binary raster mask.
+    3. Generate 3D geometry using the selected algorithm.
+    4. Save STL and preview.
+    """
+    args = arg_parse()
 
-    # 4. Create the final STL mesh
-    data = np.zeros(len(all_facets), dtype=stl_mesh.Mesh.dtype)
-    for i, f in enumerate(all_facets):
-        data['vectors'][i] = np.array(f)
-        
-    return stl_mesh.Mesh(data)
+    logger.info(f"Processing input: {args.input_file}")
+    logger.info(f"Configuration: Method={args.method}, DPMM={args.dpmm}, Thickness={args.thickness}mm")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process a Gerber file and extract contours")
-    parser.add_argument("input_file", help="Path to the input Gerber file")
-    parser.add_argument("-o", "--output", help="Path to output STL file (optional)", default="output.stl")
-    parser.add_argument("--dpmm", type=int, default=50, help="Dots per millimeter for rasterization")
-    parser.add_argument("--thickness", type=float, default=1.0, help="Thickness of the extruded contours")
+    # 1. Get binary mask from Gerber
+    # This step rasterizes the vector Gerber data into a high-res pixel grid.
+    binary_mask = get_raster_mask(args.input_file, args.dpmm)
+
+    # 2. Generate 3D Mesh based on selected method
+    final_mesh = None
+    try:
+        if args.method == 'pixel':
+            logger.info("Starting Voxel/Pixel mesh generation...")
+            final_mesh = create_pixel_mesh(binary_mask, args.thickness, args.dpmm)
+        else:
+            logger.info("Starting MultiPolygon extrusion...")
+            # Step A: Extract vector contours from the raster mask
+            polygons = get_polygons(binary_mask, args.dpmm)
+            # Step B: Extrude the purified 2D geometry into 3D
+            final_mesh = extrude_multipolygon(polygons, args.thickness)
+    except Exception as e:
+        logger.critical(f"Mesh generation failed unrecoverably: {e}", exc_info=True)
+        return # Exit gracefully without crashing the interpreter
+
+    # 3. Save output
+    if final_mesh is not None and len(final_mesh.vectors) > 0:
+        final_mesh.save(args.output)
+        logger.info(f"STL successfully saved to: {args.output}")
+        logger.info(f"Statistics: {len(final_mesh.vectors)} total facets generated.")
+    else:
+        logger.warning("Mesh result is empty! No file was saved.")
+        return
+
+    # 4. Optional Visualization
+    if not args.no_preview:
+        try:
+            display_preview(args.output)
+        except ImportError:
+            logger.warning("PyVista library not found. Skipping 3D preview.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize 3D viewer: {e}")
+
+def arg_parse():
+    """
+    Parses command line arguments and configures global logging levels.
+    """
+    parser = argparse.ArgumentParser(description="Gerber to STL Converter (Precision PCB Extrusion)")
+    parser.add_argument("input_file", help="Path to input Gerber file (.gbr)")
+    parser.add_argument("-o", "--output", help="Path to output STL file", default="output.stl")
+    parser.add_argument("--method", choices=['multipolygon', 'pixel'], default='multipolygon', 
+                        help="Algorithm: 'multipolygon' (smoother, best for traces) or 'pixel' (robust, best for complex fills)")
+    parser.add_argument("--dpmm", type=int, default=60, help="Resolution in Dots Per Millimeter (higher = smoother but slower)")
+    parser.add_argument("--thickness", type=float, default=0.035, help="Extrusion thickness in mm (default 35um for 1oz copper)")
+    parser.add_argument("--verbose", action="store_true", help="Enable detailed debug logging")
+    parser.add_argument("--no-preview", action="store_true", help="Disable the 3D preview window after processing")
+
     args = parser.parse_args()
 
-    input_file = args.input_file
-    dpmm = args.dpmm
-    thickness = args.thickness
-    output_file = args.output
+    if args.verbose:
+        # Set root logger to debug to capture logs from imported modules too
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled.")
 
-    # 1. Load and parse the Gerber file
-    gerber = GerberFile.from_file(input_file)
-    parsed = gerber.parse()
-    
-    # 2. Render to a temporary PNG (Grayscale: Copper=255, Background=0)
-    temp_render = "temp_render.png"
-    parsed.render_raster(temp_render, color_scheme=ColorScheme.DEFAULT_GRAYSCALE, dpmm=dpmm)
-    
-    # 3. Load image and convert to binary mask
-    img_pil = Image.open(temp_render).convert("L")
-    img_raw = np.asarray(img_pil)
-    
-    # Thresholding: 1 for copper, 0 for background
-    binary_mask_raw = img_raw > 127
-    
-    # 4. Add Padding (extension)
-    # Adding a 2mm border (expressed in pixels)
-    pad_px = int(2 * dpmm) 
-    binary_mask = np.pad(binary_mask_raw, pad_width=pad_px, mode='constant', constant_values=0)
-    
-    # 5. Extract contours using Marching Squares
-    # result is a list of (N, 2) arrays (row, col) coordinates
-    contours = measure.find_contours(binary_mask, level=0.5)
-    
-    # Clean up temp file
-    if os.path.exists(temp_render):
-        os.remove(temp_render)
+    return args
 
-    # 6. Plotting
-    plt.figure(figsize=(12, 12))
-    # Display the padded mask so contours align perfectly
-    plt.imshow(binary_mask, cmap="gray", origin="upper")
+def get_raster_mask(file_path, dpmm):
+    """
+    Parses a Gerber file and renders it into a boolean numpy array.
     
-    for contour in contours:
-        # contour is (y, x), so we plot (x, y)
-        plt.plot(contour[:, 1], contour[:, 0], linewidth=1.5, color="red")
-
-    plt.title(f"Extracted {len(contours)} Contours with Padding ({pad_px}px)")
-    plt.axis("equal")
-    plt.show()
-
-    print(f"Padding added: {pad_px} pixels.")
-    print(f"Found {len(contours)} separate contour loops.")
-
-    # Generate Mesh
-    out_mesh = extrude_contours(contours, args.thickness, args.dpmm)
-    out_mesh.save(output_file)
-    print(f"STL saved to: {output_file}")
-
-    # 3D Plotting Fix
+    Args:
+        file_path (str): Path to the .gbr file.
+        dpmm (int): Dots Per Millimeter (resolution).
+        
+    Returns:
+        np.ndarray: A boolean mask where True=Copper, False=Background.
+    """
+    temp_render_file = "temp_render.png"
+    
+    # 1. Parse Gerber File
     try:
-        # Load the STL file we just saved
-        mesh_pv = pv.read(args.output)
-        
-        # Create a plotter window
-        plotter = pv.Plotter(title="3D Extrusion Preview")
-        plotter.add_mesh(mesh_pv, color="gold", show_edges=True, smooth_shading=True)
-        plotter.add_axes()
-        plotter.show_grid()
-        
-        print("Opening 3D viewer...")
-        plotter.show()
+        gerber = GerberFile.from_file(file_path)
+        parsed = gerber.parse()
+    except FileNotFoundError:
+        logger.critical(f"Input file not found: {file_path}")
+        exit(1)
     except Exception as e:
-        print(f"Could not open PyVista viewer: {e}")
+        logger.critical(f"Error parsing Gerber format: {e}")
+        exit(1)
+
+    # 2. Render to Raster
+    try:
+        logger.debug(f"Rendering raster at {dpmm} DPMM...")
+        parsed.render_raster(temp_render_file, color_scheme=ColorScheme.DEFAULT_GRAYSCALE, dpmm=dpmm)
+        
+        # Load Image
+        # Convert to Grayscale ('L') -> 0..255
+        img_pil = Image.open(temp_render_file).convert("L")
+        img_arr = np.asarray(img_pil)
+        
+        # Create Boolean Mask (Thresholding)
+        # Copper is typically White (255) in standard Gerber renders
+        binary_mask = img_arr > 127
+        
+        # Cleanup temp file directly
+        img_pil.close()
+        if os.path.exists(temp_render_file): 
+            os.remove(temp_render_file)
+            
+        # Pad the mask with 0s (Background)
+        # This ensures that traces touching the edge of the Gerber bounding box
+        # are closed loops, preventing 'open manifold' errors during extrusion.
+        binary_mask = np.pad(binary_mask, pad_width=1, mode='constant', constant_values=0)
+        
+        logger.info(f"Raster generated. Dimensions: {binary_mask.shape} pixels.")
+        return binary_mask
+        
+    except Exception as e:
+        logger.critical(f"Failed during rasterization process: {e}")
+        if os.path.exists(temp_render_file): os.remove(temp_render_file)
+        exit(1)
+
+def display_preview(file_path):
+    """
+    Opens a PyVista 3D interactive window to view the generated STL.
+    """
+    import pyvista as pv
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("REMOTE_CONTAINERS"):
+        logger.warning("Headless environment detected; skipping GUI window.")
+        return
+        
+    logger.info("Opening 3D viewer (close window to exit)...")
+    mesh = pv.read(file_path)
+    
+    plotter = pv.Plotter()
+    plotter.add_mesh(mesh, color="gold", show_edges=False, metallic=True)
+    plotter.add_axes()
+    plotter.show_grid()
+    plotter.title = f"STL Preview: {os.path.basename(file_path)}"
+    plotter.show()
+
+if __name__ == "__main__":
+    main()
