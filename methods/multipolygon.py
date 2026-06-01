@@ -4,6 +4,8 @@ from stl import mesh as stl_mesh
 from shapely.geometry import Polygon
 from shapely.ops import unary_union, triangulate
 from skimage import measure
+import trimesh
+from shapely.geometry import Polygon, MultiPolygon
 
 logger = logging.getLogger(__name__)
 
@@ -83,84 +85,43 @@ def get_polygons(binary_mask, dpmm):
     
     return merged_geometry
 
+
 def extrude_multipolygon(multipoly, thickness):
     """
-    Extrudes 2D Shapely geometry into a 3D STL mesh.
-
-    Args:
-        multipoly (shapely.geometry.BaseGeometry): The 2D geometry (Polygon or MultiPolygon).
-        thickness (float): The extrusion height (Z-axis) in mm.
-
-    Returns:
-        stl.mesh.Mesh: The 3D mesh object.
+    Extrudes a Shapely Polygon or MultiPolygon into a 3D mesh,
+    and returns a native numpy-stl Mesh object.
     """
-    logger.info(f"Extruding geometry with thickness {thickness}mm...")
-    all_facets = []
+    # 1. Safely handle individual Polygons vs MultiPolygons
+    if isinstance(multipoly, Polygon):
+        polygons = [multipoly]
+    elif isinstance(multipoly, MultiPolygon):
+        polygons = list(multipoly.geoms)
+    elif hasattr(multipoly, 'geoms'): 
+        polygons = list(multipoly.geoms)
+    else:
+        polygons = list(multipoly)
+
+    meshes = []
     
-    # Normalize input to a list of Polygons
-    geoms = multipoly.geoms if hasattr(multipoly, 'geoms') else [multipoly]
-
-    logger.debug(f"Processing {len(geoms)} independent polygon islands...")
-
-    for idx, poly in enumerate(geoms):
-        if poly.is_empty: continue
+    # 2. Extrude each component polygon separately
+    for poly in polygons:
+        if poly.is_empty:
+            continue
         
-        # --- 1. Generate Vertical Walls (Side Surfaces) ---
-        
-        # A. Exterior boundary walls
-        coords = np.array(poly.exterior.coords)
-        for i in range(len(coords)-1):
-            p1, p2 = coords[i], coords[i+1]
-            # Triangle 1: BL -> BR -> TL
-            all_facets.append([[p1[0], p1[1], 0], [p2[0], p2[1], 0], [p1[0], p1[1], thickness]])
-            # Triangle 2: BR -> TR -> TL
-            all_facets.append([[p2[0], p2[1], 0], [p2[0], p2[1], thickness], [p1[0], p1[1], thickness]])
-            
-        # B. Interior hole walls
-        # Reversing order isn't strictly necessary for visualizers but helps with standard STL normals
-        for interior in poly.interiors:
-            coords = np.array(interior.coords)
-            for i in range(len(coords)-1):
-                p1, p2 = coords[i], coords[i+1]
-                # Wall faces for holes (pointing inward to the void)
-                all_facets.append([[p1[0], p1[1], 0], [p1[0], p1[1], thickness], [p2[0], p2[1], 0]])
-                all_facets.append([[p2[0], p2[1], 0], [p1[0], p1[1], thickness], [p2[0], p2[1], thickness]])
+        mesh = trimesh.creation.extrude_polygon(polygon=poly, height=thickness)
+        meshes.append(mesh)
 
-        # --- 2. Generate Horizontal Caps (Top and Bottom Surfaces) ---
-        
-        # Triangulate the polygon surface (handling holes)
-        try:
-            triangles = triangulate(poly)
-            valid_triangles = 0
-            
-            for tri in triangles:
-                # 'triangulate' creates a convex hull triangulation; we must filter 
-                # strictly what is inside our specific polygon shape.
-                if poly.contains(tri.centroid):
-                    v = list(tri.exterior.coords)
-                    
-                    # Bottom Cap (Z=0) - Normal Down
-                    all_facets.append([[v[0][0], v[0][1], 0], [v[2][0], v[2][1], 0], [v[1][0], v[1][1], 0]])
-                    
-                    # Top Cap (Z=thickness) - Normal Up
-                    all_facets.append([[v[0][0], v[0][1], thickness], [v[1][0], v[1][1], thickness], [v[2][0], v[2][1], thickness]])
-                    valid_triangles += 1
-            
-            if idx % 50 == 0:
-                logger.debug(f"island {idx}: generated caps with {valid_triangles} triangles.")
-                
-        except Exception as e:
-            logger.error(f"Triangulation failed for polygon {idx}: {e}")
-
-    logger.info(f"Geometry generation complete. Total facets: {len(all_facets)}")
-
-    # Convert to numpy-stl Mesh
-    if not all_facets:
-        logger.warning("No facets were generated! The output STL will be empty.")
+    if not meshes:
+        logger.warning("No valid geometry found to extrude. Returning empty STL.")
         return stl_mesh.Mesh(np.zeros(0, dtype=stl_mesh.Mesh.dtype))
 
-    data = np.zeros(len(all_facets), dtype=stl_mesh.Mesh.dtype)
-    for i, f in enumerate(all_facets):
-        data['vectors'][i] = np.array(f)
-        
+    # 3. Concatenate all individual meshes into one trimesh object
+    combined_trimesh = trimesh.util.concatenate(meshes)
+
+    # 4. BRIDGE TO NUMPY-STL: Convert trimesh data to numpy-stl layout
+    # trimesh.triangles gives an (N, 3, 3) array, which matches numpy-stl's 'vectors'
+    data = np.zeros(len(combined_trimesh.triangles), dtype=stl_mesh.Mesh.dtype)
+    data['vectors'] = combined_trimesh.triangles
+    
+    # Return native stl_mesh object so main.py doesn't crash on `.vectors`
     return stl_mesh.Mesh(data)
