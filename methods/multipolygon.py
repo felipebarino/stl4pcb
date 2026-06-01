@@ -2,7 +2,6 @@ import logging
 import numpy as np
 from stl import mesh as stl_mesh
 from shapely.geometry import Polygon
-from shapely.ops import unary_union, triangulate
 from skimage import measure
 import trimesh
 from shapely.geometry import Polygon, MultiPolygon
